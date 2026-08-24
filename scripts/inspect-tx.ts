@@ -1,0 +1,1 @@
+import{createClient}from"genlayer-js";import{studionet}from"genlayer-js/chains";const c=createClient({chain:studionet}),hash=process.argv[2] as `0x${string}`;console.log(JSON.stringify(await c.getTransaction({hash:hash as never}),null,2));
