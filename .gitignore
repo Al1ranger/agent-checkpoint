@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 deployment.json
 retry-proofs.json
+.proof-private-key

@@ -1,13 +1,20 @@
 import fs from "node:fs";
-import { createAccount, createClient } from "genlayer-js";
+import { createAccount, createClient, generatePrivateKey } from "genlayer-js";
 import { studionet } from "genlayer-js/chains";
 import { TransactionStatus } from "genlayer-js/types";
-const {address}=JSON.parse(fs.readFileSync("deployment.json","utf8")),account=createAccount(),client=createClient({chain:studionet,account}),agent="climate-research-agent",base="https://raw.githubusercontent.com/Al1ranger/agent-checkpoint/main/proof-data",proofs:any[]=[];
-async function write(functionName:string,args:any[]){const hash=await client.writeContract({address,functionName,args,account,value:0n});console.log(`${functionName}=${hash}`);const receipt:any=await client.waitForTransactionReceipt({hash:hash as never,status:TransactionStatus.FINALIZED,interval:5000,retries:180});const fatal=(receipt.consensus_data?.leader_receipt??[]).filter((x:any)=>x.execution_result!=="SUCCESS"&&x.genvm_result?.error_code!=="CONSENSUS_VALIDATOR_QUORUM_REACHED");if(receipt.result_name!=="MAJORITY_AGREE"||fatal.length)throw Error(JSON.stringify({functionName,hash,result:receipt.result_name,fatal}));const proof={functionName,hash,explorer:`https://explorer-studio.genlayer.com/tx/${hash}`};proofs.push(proof);return proof;}
-await write("create_agent",[agent]);
-await write("create_checkpoint",["checkpoint-v1",agent,1,"",`${base}/checkpoint-v1.json`,"90dc27a5290defc37a215c0ba6726e777f854b0649885cab449b96a73e8f834a"]);await write("verify_checkpoint",["checkpoint-v1"]);
+const {address}=JSON.parse(fs.readFileSync("deployment.json","utf8")),keyFile=".proof-private-key",privateKey=(fs.existsSync(keyFile)?fs.readFileSync(keyFile,"utf8").trim():generatePrivateKey()) as `0x${string}`;if(!fs.existsSync(keyFile))fs.writeFileSync(keyFile,privateKey);const account=createAccount(privateKey),client=createClient({chain:studionet,account}),agent="climate-research-agent",base="https://raw.githubusercontent.com/Al1ranger/agent-checkpoint/main/proof-data",proofs:any[]=[];
+async function write(functionName:string,args:any[]){const hash=await client.writeContract({address,functionName,args,account,value:0n});console.log(`${functionName}=${hash}`);let receipt:any;for(let i=0;i<8;i++){try{receipt=await client.waitForTransactionReceipt({hash:hash as never,status:TransactionStatus.FINALIZED,interval:5000,retries:180});break}catch(error){if(i===7)throw error;}}const fatal=(receipt.consensus_data?.leader_receipt??[]).filter((x:any)=>x.execution_result!=="SUCCESS"&&x.genvm_result?.error_code!=="CONSENSUS_VALIDATOR_QUORUM_REACHED");if(receipt.result_name!=="MAJORITY_AGREE"||fatal.length)throw Error(JSON.stringify({functionName,hash,result:receipt.result_name,fatal}));const proof={functionName,hash,explorer:`https://explorer-studio.genlayer.com/tx/${hash}`};proofs.push(proof);return proof;}
+if(process.env.RESUME!=="1"){
+  await write("create_agent",[agent]);
+  await write("create_checkpoint",["checkpoint-v1",agent,1,"",`${base}/checkpoint-v1.json`,"90dc27a5290defc37a215c0ba6726e777f854b0649885cab449b96a73e8f834a"]);await write("verify_checkpoint",["checkpoint-v1"]);
+}
 await write("create_checkpoint",["checkpoint-v2-drift-attempt-1",agent,2,"checkpoint-v1",`${base}/checkpoint-v2-drift-retry.json`,"52a18c0c066f8b95e0728d1792696b4d88331c7610b5da9ff34f47193d020493"]);await write("verify_checkpoint",["checkpoint-v2-drift-attempt-1"]);
 await write("create_checkpoint",["checkpoint-v2-corrected-attempt-2",agent,2,"checkpoint-v1",`${base}/checkpoint-v2.json`,"a47bf139ce9b393be6516a5a5d8a3c1d5f4917f058a1375436b86e9390ad2c57"]);await write("verify_checkpoint",["checkpoint-v2-corrected-attempt-2"]);
-const [record,failed,corrected,latest]=await Promise.all([client.readContract({address,functionName:"get_agent",args:[agent]}),client.readContract({address,functionName:"get_checkpoint",args:["checkpoint-v2-drift-attempt-1"]}),client.readContract({address,functionName:"get_checkpoint",args:["checkpoint-v2-corrected-attempt-2"]}),client.readContract({address,functionName:"get_latest_attempt",args:[agent,2])])]) as any[];
+const [record,failed,corrected,latest]=await Promise.all([
+  client.readContract({address,functionName:"get_agent",args:[agent]}),
+  client.readContract({address,functionName:"get_checkpoint",args:["checkpoint-v2-drift-attempt-1"]}),
+  client.readContract({address,functionName:"get_checkpoint",args:["checkpoint-v2-corrected-attempt-2"]}),
+  client.readContract({address,functionName:"get_latest_attempt",args:[agent,2]})
+]) as any[];
 if(failed.state!=="DRIFTED"||failed.attempt!==1||corrected.state!=="VERIFIED"||corrected.attempt!==2||corrected.replacement_of!=="checkpoint-v2-drift-attempt-1"||record.latest_version!==2||record.latest_checkpoint!=="checkpoint-v2-corrected-attempt-2"||latest.certificate_fingerprint!==corrected.certificate_fingerprint)throw Error("retry invariant failed");
 fs.writeFileSync("retry-proofs.json",JSON.stringify({address,proofs,stored:{record,failed,corrected,latest}},null,2));console.log(JSON.stringify({address,proofs,stored:{record,failed,corrected,latest}},null,2));
