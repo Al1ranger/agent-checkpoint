@@ -8,7 +8,7 @@ MAX_ID=80
 MAX_URL=512
 MAX_BODY=24000
 MAX_DOMAINS=8
-POLICY="agent-checkpoint-v1-exact-certificate"
+POLICY="agent-checkpoint-v2-retry-safe-exact-certificate"
 DOMAIN_TYPES=("TASK_STATE","MEMORY_STATE","CAPABILITY_STATE","POLICY_STATE","DEPENDENCY_STATE")
 
 @allow_storage
@@ -31,6 +31,8 @@ class Checkpoint:
     state: str
     certificate_json: str
     certificate_fingerprint: str
+    replacement_of: str
+    attempt: u64
 
 class AgentCheckpoint(gl.Contract):
     agents: TreeMap[str,AgentRecord]
@@ -38,6 +40,9 @@ class AgentCheckpoint(gl.Contract):
     checkpoints: TreeMap[str,Checkpoint]
     checkpoint_exists: TreeMap[str,bool]
     version_reserved: TreeMap[str,bool]
+    latest_attempt: TreeMap[str,str]
+    attempt_count: TreeMap[str,u64]
+    version_finalized: TreeMap[str,bool]
     total_agents: u64
     total_checkpoints: u64
 
@@ -58,7 +63,6 @@ class AgentCheckpoint(gl.Contract):
         if agent.controller!=gl.message.sender_address: raise gl.vm.UserError("EXPECTED: only controller")
         if self.checkpoint_exists.get(cid,False): raise gl.vm.UserError("EXPECTED: checkpoint exists")
         key=self._version_key(aid,version)
-        if self.version_reserved.get(key,False): raise gl.vm.UserError("EXPECTED: version reserved")
         expected=u64(int(agent.latest_version)+1)
         if version!=expected: raise gl.vm.UserError("EXPECTED: non-sequential version")
         parent=parent_id.strip()
@@ -67,9 +71,18 @@ class AgentCheckpoint(gl.Contract):
         else:
             parent=self._id(parent,"parent")
             if parent!=agent.latest_checkpoint: raise gl.vm.UserError("EXPECTED: parent is not active head")
+        replacement="";attempt=u64(1)
+        if self.version_finalized.get(key,False): raise gl.vm.UserError("EXPECTED: version finalized")
+        if self.version_reserved.get(key,False):
+            replacement=self.latest_attempt.get(key,"")
+            if len(replacement)==0: raise gl.vm.UserError("EXPECTED: missing prior attempt")
+            prior=self._checkpoint(replacement)
+            if prior.state not in ("DRIFTED","INVALID","INDETERMINATE","UNAVAILABLE"): raise gl.vm.UserError("EXPECTED: prior attempt not retryable")
+            if prior.parent_id!=parent or agent.latest_checkpoint!=parent: raise gl.vm.UserError("EXPECTED: retry parent changed")
+            attempt=u64(int(self.attempt_count.get(key,u64(0)))+1)
         root=self._hex64(claimed_root,"root")
-        self.checkpoints[cid]=Checkpoint(aid,version,parent,self._public_https(manifest_url),root,"PROPOSED","","")
-        self.checkpoint_exists[cid]=True;self.version_reserved[key]=True;self.total_checkpoints+=u64(1)
+        self.checkpoints[cid]=Checkpoint(aid,version,parent,self._public_https(manifest_url),root,"PROPOSED","","",replacement,attempt)
+        self.checkpoint_exists[cid]=True;self.version_reserved[key]=True;self.latest_attempt[key]=cid;self.attempt_count[key]=attempt;self.total_checkpoints+=u64(1)
 
     @gl.public.write
     def verify_checkpoint(self,checkpoint_id:str)->None:
@@ -79,9 +92,12 @@ class AgentCheckpoint(gl.Contract):
         item.certificate_json=canonical;item.certificate_fingerprint=hashlib.sha256(canonical.encode()).hexdigest()
         item.state=report["decision"];self.checkpoints[cid]=item
         if report["decision"]=="VERIFIED":
+            key=self._version_key(item.agent_id,item.version)
+            if self.latest_attempt.get(key,"")!=cid: raise gl.vm.UserError("EXPECTED: superseded attempt")
+            if self.version_finalized.get(key,False): raise gl.vm.UserError("EXPECTED: version finalized")
             if agent.latest_checkpoint!=item.parent_id: raise gl.vm.UserError("EXPECTED: head changed")
             if int(item.version)!=int(agent.latest_version)+1: raise gl.vm.UserError("EXPECTED: version changed")
-            agent.latest_checkpoint=cid;agent.latest_version=item.version;agent.checkpoint_count+=u64(1);self.agents[item.agent_id]=agent
+            self.version_finalized[key]=True;agent.latest_checkpoint=cid;agent.latest_version=item.version;agent.checkpoint_count+=u64(1);self.agents[item.agent_id]=agent
 
     @gl.public.write
     def restore_checkpoint(self,agent_id:str,checkpoint_id:str)->None:
@@ -97,6 +113,12 @@ class AgentCheckpoint(gl.Contract):
 
     @gl.public.view
     def get_checkpoint(self,checkpoint_id:str)->Checkpoint: return self._checkpoint(self._id(checkpoint_id,"checkpoint"))
+
+    @gl.public.view
+    def get_latest_attempt(self,agent_id:str,version:u64)->Checkpoint:
+        aid=self._id(agent_id,"agent");self._agent(aid);cid=self.latest_attempt.get(self._version_key(aid,version),"")
+        if len(cid)==0: raise gl.vm.UserError("EXPECTED: no version attempt")
+        return self.checkpoints[cid]
 
     @gl.public.view
     def get_latest_checkpoint(self,agent_id:str)->Checkpoint:
@@ -124,7 +146,7 @@ class AgentCheckpoint(gl.Contract):
             decision=self._decision(current,parent,semantic,item.claimed_root)
             safe=decision=="VERIFIED" and semantic["identity"]=="SAME" and semantic["role"] in ("SAME","EXPANDED") and semantic["policy"] in ("SAME","TIGHTENED")
             if int(item.version)==1 and decision=="VERIFIED": safe=True
-            record={"policy_version":POLICY,"checkpoint_id":cid,"agent_id":item.agent_id,"version":int(item.version),"parent_id":item.parent_id,
+            record={"policy_version":POLICY,"checkpoint_id":cid,"agent_id":item.agent_id,"version":int(item.version),"parent_id":item.parent_id,"replacement_of":item.replacement_of,"attempt":int(item.attempt),
                 "manifest_status":current["status"],"manifest_http":current["http"],"manifest_fingerprint":current["manifest_fingerprint"],
                 "declared_domain_count":current["declared_count"],"verified_domain_count":current["verified_count"],"domain_receipts":current["receipts"],
                 "computed_root":current["computed_root"],"claimed_root":item.claimed_root,"parent_status":parent["status"],"parent_manifest_fingerprint":parent["manifest_fingerprint"],
@@ -178,7 +200,7 @@ class AgentCheckpoint(gl.Contract):
         return "VERIFIED"
 
     def _valid_report(self,r,cid,item):
-        if not isinstance(r,dict) or r.get("checkpoint_id")!=cid or r.get("agent_id")!=item.agent_id or r.get("claimed_root")!=item.claimed_root: return False
+        if not isinstance(r,dict) or r.get("checkpoint_id")!=cid or r.get("agent_id")!=item.agent_id or r.get("claimed_root")!=item.claimed_root or r.get("replacement_of")!=item.replacement_of or int(r.get("attempt",0))!=int(item.attempt): return False
         if r.get("decision") not in ("VERIFIED","DRIFTED","INVALID","INDETERMINATE","UNAVAILABLE") or not isinstance(r.get("safe_restore"),bool): return False
         receipts=r.get("domain_receipts",[])
         if not isinstance(receipts,list) or int(r.get("declared_domain_count",-1))!=len(receipts): return False
