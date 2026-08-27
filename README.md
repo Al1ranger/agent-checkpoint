@@ -28,3 +28,6 @@ node tests/invariants.mjs
 ## License
 
 Apache-2.0
+# Retry correction
+
+The current deployment includes immutable same-version replacement attempts for every non-verified terminal result. See [RETRY_CORRECTION.md](RETRY_CORRECTION.md) for the source-matched deployment and live failed-attempt → corrected-retry proof.
